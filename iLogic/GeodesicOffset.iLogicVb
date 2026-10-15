@@ -1,0 +1,1458 @@
+' =====================================================================
+'  Offset geodezyjny - strefa oblaminowania króćców na powierzchni zbiornika
+'  Reguła iLogic (prototyp), uruchamiana w ZŁOŻENIU.
+'
+'  Tryb AUTOMATYCZNY:
+'   1. Użytkownik wskazuje rysunek DWG z tabelą króćców.
+'   2. Tabela jest czytana przez AutoCAD w tle (accoreconsole -> DXF),
+'      szerokość oblaminowania X = L1 + 6·S6 dla każdej pozycji N1, N2...
+'   3. Pozycja jest łączona z króćcem w złożeniu (numer N w nazwie
+'      wystąpienia, a gdy go brak - iProperty Description + DN).
+'   4. Krawędź wpalenia jest szukana przy osi króćca, strefa liczona jak
+'      w trybie ręcznym.
+'   5. Wszystkie strefy trafiają jako bryły do jednego podzłożenia.
+'
+'  Tryb RĘCZNY: podajesz X i wskazujesz ZEWNĘTRZNĄ krawędź wpalenia.
+'
+'  Strefa: z każdego punktu krawędzi wpalenia "strzela" geodezyjna
+'  prostopadła do krawędzi i idzie po ZEWNĘTRZNEJ powłoce złożenia na
+'  odległość X (promień rzucany "z góry" przez całe złożenie - wzmocnienia
+'  jako ta sama bryła, osobna bryła albo osobna część są traktowane
+'  jednakowo). Przed przeszkodą (inne wpalenie, koniec zbiornika, uskok
+'  > MaxSlopeDeg) promień kończy się min. ClearanceCm wcześniej.
+'  Wynik: powierzchnia (loft przez pierścienie na zbiorniku) pogrubiona
+'  na zewnątrz do bryły - Visual Components widzi tylko bryły.
+'
+'  Jednostki: API Inventora liczy w cm - wszystko w środku jest w cm.
+' =====================================================================
+Imports System.Collections.Generic
+Imports System.Globalization
+Imports System.Linq
+Imports System.Text
+Imports System.Text.RegularExpressions
+
+Sub Main()
+	If ThisApplication.ActiveDocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
+		MessageBox.Show("Uruchom regułę w złożeniu zbiornika.", "Offset geodezyjny")
+		Exit Sub
+	End If
+	Dim asmDoc As AssemblyDocument = ThisApplication.ActiveDocument
+
+	Dim mode As System.Windows.Forms.DialogResult = MessageBox.Show( _
+		"TAK - automatycznie: wszystkie króćce, X z tabeli rysunku DWG (L1 + 6·S6)" & vbCrLf & vbCrLf & _
+		"NIE - ręcznie: podajesz X i wskazujesz krawędź wpalenia", "Offset geodezyjny", _
+		System.Windows.Forms.MessageBoxButtons.YesNoCancel, System.Windows.Forms.MessageBoxIcon.Question)
+	If mode = System.Windows.Forms.DialogResult.Yes Then
+		RunAuto(asmDoc)
+	ElseIf mode = System.Windows.Forms.DialogResult.No Then
+		RunManual(asmDoc)
+	End If
+End Sub
+
+' Parametry obliczeń - jedno miejsce dla obu trybów.
+Sub Configure(calc As GeodesicOffset)
+	calc.EdgeSampleStepCm = 1.0   ' co ile punkt na krawędzi wpalenia (10 mm)
+	calc.MarchStepCm = 1.0        ' krok marszu po powierzchni (10 mm)
+	calc.RingCount = 4            ' liczba pierścieni pośrednich dla loftu
+	calc.MaxSlopeDeg = 70.0       ' ostrzejsze załamanie powierzchni = przeszkoda
+	calc.ClearanceCm = 2.0        ' min. odsunięcie od przeszkody (20 mm)
+	calc.ThicknessCm = 0.1        ' grubość bryły na zewnątrz zbiornika (1 mm)
+End Sub
+
+' ---------------------------------------------------------------
+'  Tryb ręczny
+' ---------------------------------------------------------------
+Sub RunManual(asmDoc As AssemblyDocument)
+	Dim xStr As String = InputBox("Szerokość oblaminowania X [mm]" & vbCrLf & _
+		"(mierzona po powierzchni zbiornika od krawędzi wpalenia):", "Offset geodezyjny", "100")
+	If xStr = "" Then Exit Sub
+	Dim xMm As Double
+	If Not Double.TryParse(xStr.Replace(",", "."), NumberStyles.Float, CultureInfo.InvariantCulture, xMm) OrElse xMm <= 0 Then
+		MessageBox.Show("Niepoprawna wartość X: " & xStr, "Offset geodezyjny")
+		Exit Sub
+	End If
+
+	Dim picked As Object = ThisApplication.CommandManager.Pick(SelectionFilterEnum.kPartEdgeFilter, _
+		"Wskaż ZEWNĘTRZNĄ krawędź wpalenia na zbiorniku (Esc = anuluj)")
+	If picked Is Nothing Then Exit Sub
+
+	Dim hidden As List(Of ComponentOccurrence) = HideOldResults(asmDoc)
+	Dim sw As New System.Diagnostics.Stopwatch()
+	sw.Start()
+	Try
+		Dim calc As New GeodesicOffset(ThisApplication, asmDoc.ComponentDefinition)
+		Configure(calc)
+		calc.XCm = xMm / 10.0
+		calc.Compute(CType(picked, Edge))
+		Dim tCompute As Double = sw.ElapsedMilliseconds / 1000.0
+		RestoreHidden(hidden)
+		Dim occ As ComponentOccurrence = calc.CreateResultPart(asmDoc.ComponentDefinition, _
+			GeodesicOffset.ResultPrefix & "X" & FormatMm(xMm))
+
+		sw.Stop()
+		Dim msg As String = "Gotowe." & vbCrLf & _
+			"X = " & xMm.ToString("0.###") & " mm" & vbCrLf & _
+			"Ścian skóry zbiornika: " & calc.SkinFaceCount & vbCrLf & _
+			"Krawędzi wpalenia: " & calc.HoleEdgeCount & vbCrLf & _
+			"Promieni geodezyjnych: " & calc.RayCount & vbCrLf & _
+			"Promieni skróconych przez przeszkody: " & calc.ShortenedRayCount & vbCrLf & _
+			"Pole oblaminowania: " & (calc.ResultAreaCm2 / 10000.0).ToString("0.0000") & " m²" & vbCrLf & _
+			"Wystąpienie: " & occ.Name & vbCrLf & _
+			"Czas: " & (sw.ElapsedMilliseconds / 1000.0).ToString("0.0") & " s" & _
+			" (obliczenia " & tCompute.ToString("0.0") & " s, część " & (sw.ElapsedMilliseconds / 1000.0 - tCompute).ToString("0.0") & " s)"
+		If calc.Warnings.Count > 0 Then
+			msg &= vbCrLf & vbCrLf & "UWAGI:" & vbCrLf & String.Join(vbCrLf, calc.Warnings.ToArray())
+		End If
+		MessageBox.Show(msg, "Offset geodezyjny")
+	Catch ex As Exception
+		MessageBox.Show("Błąd: " & ex.Message, "Offset geodezyjny")
+	Finally
+		RestoreHidden(hidden)
+	End Try
+End Sub
+
+' ---------------------------------------------------------------
+'  Tryb automatyczny
+' ---------------------------------------------------------------
+Sub RunAuto(asmDoc As AssemblyDocument)
+	Dim dwgPath As String = PickDwg(asmDoc)
+	If dwgPath = "" Then Exit Sub
+
+	Dim sw As New System.Diagnostics.Stopwatch()
+	sw.Start()
+	Dim header As New List(Of String)
+	Dim rows As List(Of NozzleRow)
+	Try
+		ThisApplication.StatusBarText = "Offset geodezyjny: odczyt tabeli króćców z DWG (AutoCAD w tle, ok. 1 min)..."
+		rows = NozzleTable.ReadDwg(dwgPath)
+	Catch ex As Exception
+		MessageBox.Show("Nie udało się odczytać tabeli króćców z rysunku:" & vbCrLf & ex.Message, "Offset geodezyjny")
+		Exit Sub
+	End Try
+	Dim tTable As Double = sw.ElapsedMilliseconds / 1000.0
+
+	Dim revModel As String = Revision(asmDoc.FullFileName)
+	Dim revDwg As String = Revision(dwgPath)
+	If revModel <> "" AndAlso revDwg <> "" AndAlso revModel <> revDwg Then
+		header.Add("UWAGA: rewizja rysunku (REV." & revDwg & ") różni się od rewizji modelu (REV." & revModel & ").")
+	End If
+
+	' Najpierw liczymy wszystkie strefy (stare wyniki ukryte), dopiero potem tworzymy bryły -
+	' gotowa bryła leżąca na zbiorniku przeszkadzałaby w liczeniu następnych.
+	Dim done As New List(Of KeyValuePair(Of NozzleRow, GeodesicOffset))
+	Dim used As New HashSet(Of String)
+	Dim hidden As List(Of ComponentOccurrence) = HideOldResults(asmDoc)
+	Try
+		For Each row In rows
+			If Double.IsNaN(row.XMm) Then
+				row.Status = "brak S6/L1 w tabeli - pominięto"
+				Continue For
+			End If
+			ThisApplication.StatusBarText = "Offset geodezyjny: " & row.Pos & " (X = " & FormatMm(row.XMm) & " mm)..."
+			Dim why As String = ""
+			Dim occ As ComponentOccurrence = NozzleMatcher.Find(asmDoc.ComponentDefinition, row, used, why)
+			If occ Is Nothing Then
+				row.Status = why
+				Continue For
+			End If
+			used.Add(occ.Name)
+			row.OccName = occ.Name
+			Try
+				Dim calc As New GeodesicOffset(ThisApplication, asmDoc.ComponentDefinition)
+				Configure(calc)
+				calc.XCm = row.XMm / 10.0
+				calc.Compute(calc.FindHoleEdge(occ, If(Double.IsNaN(row.DN), 10.0, row.DN / 10.0)))
+				done.Add(New KeyValuePair(Of NozzleRow, GeodesicOffset)(row, calc))
+			Catch ex As Exception
+				row.Status = "błąd: " & ex.Message
+			End Try
+		Next
+	Finally
+		RestoreHidden(hidden)
+	End Try
+	Dim tCompute As Double = sw.ElapsedMilliseconds / 1000.0 - tTable
+
+	If done.Count > 0 Then
+		ThisApplication.StatusBarText = "Offset geodezyjny: tworzenie brył..."
+		Dim tpl As String = ThisApplication.FileManager.GetTemplateFile(DocumentTypeEnum.kAssemblyDocumentObject, SystemOfMeasureEnum.kMetricSystemOfMeasure)
+		Dim subDoc As AssemblyDocument = ThisApplication.Documents.Add(DocumentTypeEnum.kAssemblyDocumentObject, tpl, False)
+		For Each kv In done
+			Dim row As NozzleRow = kv.Key
+			Dim calc As GeodesicOffset = kv.Value
+			Try
+				calc.CreateResultPart(subDoc.ComponentDefinition, row.Pos & "_X" & FormatMm(row.XMm))
+				row.Status = "OK  promieni " & calc.RayCount & _
+					If(calc.ShortenedRayCount > 0, ", skróconych przez przeszkody " & calc.ShortenedRayCount, "") & _
+					", pole " & (calc.ResultAreaCm2 / 10000.0).ToString("0.000") & " m²"
+				If calc.Warnings.Count > 0 Then row.Status &= "  UWAGI: " & String.Join(" / ", calc.Warnings.ToArray())
+			Catch ex As Exception
+				row.Status = "błąd tworzenia bryły: " & ex.Message & _
+					"  [promieni " & calc.RayCount & ", skróconych " & calc.ShortenedRayCount & _
+					If(calc.Warnings.Count > 0, "; " & String.Join(" / ", calc.Warnings.ToArray()), "") & "]"
+			End Try
+		Next
+		Dim subOcc As ComponentOccurrence = asmDoc.ComponentDefinition.Occurrences.AddByComponentDefinition( _
+			subDoc.ComponentDefinition, ThisApplication.TransientGeometry.CreateMatrix())
+		subOcc.Grounded = True
+		GeodesicOffset.SetUniqueName(subOcc, GeodesicOffset.ResultPrefix & "strefy")
+	End If
+	ThisApplication.StatusBarText = ""
+	sw.Stop()
+
+	' Króćce w modelu, których nie ma w tabeli.
+	Dim tableNums As New HashSet(Of Integer)(rows.Select(Function(r) r.Number))
+	Dim extra As New List(Of String)
+	For Each o As ComponentOccurrence In asmDoc.ComponentDefinition.Occurrences
+		Dim n As Integer = NozzleMatcher.PosNumber(o.Name)
+		If n > 0 AndAlso Not tableNums.Contains(n) AndAlso Not extra.Contains("N" & n) Then extra.Add("N" & n)
+	Next
+
+	Dim sb As New StringBuilder()
+	For Each h In header
+		sb.AppendLine(h)
+	Next
+	If header.Count > 0 Then sb.AppendLine()
+	For Each row In rows
+		sb.AppendLine(row.Pos & "  X=" & If(Double.IsNaN(row.XMm), "?", FormatMm(row.XMm)) & " mm  " & row.Status)
+	Next
+	If extra.Count > 0 Then
+		sb.AppendLine()
+		sb.AppendLine("W modelu, brak w tabeli: " & String.Join(", ", extra.ToArray()))
+	End If
+	sb.AppendLine()
+	sb.AppendLine("Rysunek: " & IO.Path.GetFileName(dwgPath))
+	sb.AppendLine("Czas: " & (sw.ElapsedMilliseconds / 1000.0).ToString("0") & " s (tabela " & tTable.ToString("0") & _
+		" s, strefy " & tCompute.ToString("0") & " s, bryły " & (sw.ElapsedMilliseconds / 1000.0 - tTable - tCompute).ToString("0") & " s)")
+	MessageBox.Show(sb.ToString(), "Offset geodezyjny - wszystkie króćce")
+End Sub
+
+Function PickDwg(asmDoc As AssemblyDocument) As String
+	Dim dlg As New System.Windows.Forms.OpenFileDialog()
+	dlg.Title = "Rysunek DWG z tabelą króćców"
+	dlg.Filter = "Rysunek AutoCAD (*.dwg)|*.dwg"
+	Dim folder As String = FindDrawingsFolder(asmDoc.FullFileName)
+	If folder <> "" Then dlg.InitialDirectory = folder
+	If dlg.ShowDialog() <> System.Windows.Forms.DialogResult.OK Then Return ""
+	Return dlg.FileName
+End Function
+
+' Rysunki projektu leżą w folderze 3_Drawings (Vault) - szukamy go w górę od złożenia.
+Function FindDrawingsFolder(asmPath As String) As String
+	If asmPath = "" Then Return ""
+	Dim d As String = IO.Path.GetDirectoryName(asmPath)
+	While Not String.IsNullOrEmpty(d)
+		If IO.Path.GetFileName(d).Equals("3_Drawings", StringComparison.OrdinalIgnoreCase) Then Return d
+		Dim c As String = IO.Path.Combine(d, "3_Drawings")
+		If IO.Directory.Exists(c) Then Return c
+		d = IO.Path.GetDirectoryName(d)
+	End While
+	Return ""
+End Function
+
+Function Revision(path As String) As String
+	Dim m As Match = Regex.Match(IO.Path.GetFileName(path), "REV\.?\s*(\d+)", RegexOptions.IgnoreCase)
+	Return If(m.Success, m.Groups(1).Value, "")
+End Function
+
+Function FormatMm(v As Double) As String
+	Return v.ToString("0.#", CultureInfo.InvariantCulture)
+End Function
+
+' Poprzednie wyniki leżą na zbiorniku - ukrywamy je na czas liczenia, żeby promienie ich nie trafiały.
+Function HideOldResults(asmDoc As AssemblyDocument) As List(Of ComponentOccurrence)
+	Dim hidden As New List(Of ComponentOccurrence)
+	For Each o As ComponentOccurrence In asmDoc.ComponentDefinition.Occurrences
+		If o.Name.StartsWith(GeodesicOffset.ResultPrefix) AndAlso o.Visible Then
+			o.Visible = False
+			hidden.Add(o)
+		End If
+	Next
+	Return hidden
+End Function
+
+Sub RestoreHidden(hidden As List(Of ComponentOccurrence))
+	For Each o As ComponentOccurrence In hidden
+		o.Visible = True
+	Next
+	hidden.Clear()
+End Sub
+
+' =====================================================================
+'  Rdzeń obliczeń - celowo bez zależności od iLogic, żeby przenieść
+'  go 1:1 do Add-Inu.
+' =====================================================================
+Public Class GeodesicOffset
+
+	Public Const ResultPrefix As String = "Oblaminowanie_"
+
+	Public XCm As Double = 10.0
+	Public EdgeSampleStepCm As Double = 1.0
+	Public MarchStepCm As Double = 1.0
+	Public RingCount As Integer = 4
+	Public MaxSlopeDeg As Double = 70.0
+	Public ClearanceCm As Double = 2.0
+	Public ThicknessCm As Double = 0.1    ' grubość bryły (0 = tylko powierzchnia)
+	Public GapTolCm As Double = 0.05      ' szczelina między stykającymi się bryłami liczona jako materiał
+	Public AirLiftCm As Double = 0.05     ' start promieni marszu tuż nad powłoką (na pewno w powietrzu)
+	Public DepthTolCm As Double = 0.02    ' tolerancja przy szukaniu początku ubytku materiału
+	Public MinRayCm As Double = 0.1       ' najkrótszy promień (żeby loft się nie zdegenerował)
+
+	Public Warnings As New List(Of String)
+	Public RayCount As Integer
+	Public ShortenedRayCount As Integer
+	Public ResultAreaCm2 As Double
+
+	' rings(r)(i) = punkt i-tego promienia na odległości L_i*r/RingCount, r = 0 to krawędź wpalenia
+	Private _rings As List(Of List(Of Double()))
+
+	Private _app As Inventor.Application
+	Private _tg As TransientGeometry
+	Private _asmDef As AssemblyComponentDefinition
+	Private _skin As New List(Of Face)
+	Private _skinIndex As New Dictionary(Of String, Integer)
+	Private _holeEdgeCount As Integer
+	Private _normalSign As Double = 1.0
+	Private _rays As New List(Of RayPath)
+	Private _obstacles As New List(Of Double())
+
+	Public Sub New(app As Inventor.Application, asmDef As AssemblyComponentDefinition)
+		_app = app
+		_tg = app.TransientGeometry
+		_asmDef = asmDef
+	End Sub
+
+	Public ReadOnly Property SkinFaceCount As Integer
+		Get
+			Return _skin.Count
+		End Get
+	End Property
+
+	Public ReadOnly Property HoleEdgeCount As Integer
+		Get
+			Return _holeEdgeCount
+		End Get
+	End Property
+
+	' ---------------------------------------------------------------
+	'  Główny przebieg
+	' ---------------------------------------------------------------
+	Public Sub Compute(pickedEdge As Edge)
+		If pickedEdge.Faces.Count <> 2 Then Throw New Exception("Krawędź wpalenia nie leży między dwiema ścianami.")
+
+		' Skóra zbiornika = większa z dwóch ścian przy krawędzi (ścianka wycięcia to wąski pas).
+		' Służy tylko do domknięcia pętli wpalenia; marsz idzie po całym złożeniu.
+		Dim f1 As Face = pickedEdge.Faces.Item(1)
+		Dim f2 As Face = pickedEdge.Faces.Item(2)
+		Dim seed As Face = If(f1.Evaluator.Area >= f2.Evaluator.Area, f1, f2)
+		BuildSkin(seed)
+
+		If Not IsHoleBoundary(pickedEdge) Then
+			Throw New Exception("Krawędź nie jest krawędzią wpalenia (obie ściany należą do powierzchni zbiornika).")
+		End If
+
+		Dim chain As List(Of KeyValuePair(Of Edge, Boolean)) = ChainHoleLoop(pickedEdge)
+		_holeEdgeCount = chain.Count
+
+		DetectNormalSign(pickedEdge)
+
+		For Each item In chain
+			ShootFromEdge(item.Key, item.Value)
+		Next
+		RayCount = _rays.Count
+
+		ApplyLateralClearance()
+		BuildRings()
+	End Sub
+
+	' ---------------------------------------------------------------
+	'  Krawędź wpalenia przy osi króćca (tryb automatyczny).
+	'  Króćce Plasticon mają oś = lokalna oś X wystąpienia, początek na
+	'  powierzchni zbiornika; pozostałe osie są sprawdzane awaryjnie.
+	' ---------------------------------------------------------------
+	Public Function FindHoleEdge(occ As ComponentOccurrence, dnCm As Double) As Edge
+		Dim m As Matrix = occ.Transformation
+		Dim o() As Double = {m.Cell(1, 4), m.Cell(2, 4), m.Cell(3, 4)}
+		For Each col As Integer In New Integer() {1, 3, 2}
+			Dim ax() As Double = Normalize(New Double() {m.Cell(1, col), m.Cell(2, col), m.Cell(3, col)})
+			For Each sgn As Double In New Double() {1.0, -1.0}
+				Dim e As Edge = FindHoleEdgeAlong(o, Scale(ax, sgn), dnCm)
+				If e IsNot Nothing Then Return e
+			Next
+		Next
+		Throw New Exception("nie znaleziono krawędzi wpalenia przy osi króćca")
+	End Function
+
+	' Promień "z góry" (wzdłuż osi) tuż obok otworu trafia w zewnętrzną ścianę zbiornika;
+	' z jej krawędzi bierzemy najbliższą osi - to krawędź wpalenia.
+	Private Function FindHoleEdgeAlong(o() As Double, ax() As Double, dnCm As Double) As Edge
+		Dim p1() As Double = Normalize(Cross(ax, If(Math.Abs(ax(0)) < 0.9, New Double() {1, 0, 0}, New Double() {0, 1, 0})))
+		Dim p2() As Double = Cross(ax, p1)
+		Dim op As Inventor.Point = _tg.CreatePoint(o(0), o(1), o(2))
+		For Each r As Double In New Double() {dnCm * 0.6 + 1.0, dnCm * 0.75 + 2.0, dnCm + 3.0}
+			For k As Integer = 0 To 3
+				Dim ang As Double = k * Math.PI / 2.0
+				Dim q() As Double = Add(o, Scale(Add(Scale(p1, Math.Cos(ang)), Scale(p2, Math.Sin(ang))), r))
+				Dim hit() As Double = Nothing, hitN() As Double = Nothing, depth As Double
+				Dim face As Face = Nothing
+				If Not CastDown(q, ax, 1.0, hit, hitN, depth, face) Then Continue For
+				If Math.Abs(Dot(Subtract(hit, o), ax)) > Math.Max(10.0, r) Then Continue For
+				Dim best As Edge = Nothing
+				Dim bestD As Double = Double.MaxValue
+				For Each e As Edge In face.Edges
+					Dim c As Inventor.Point = e.GetClosestPointTo(op)
+					Dim dd As Double = Length(Subtract(New Double() {c.X, c.Y, c.Z}, o))
+					If dd < bestD Then
+						bestD = dd
+						best = e
+					End If
+				Next
+				If best IsNot Nothing AndAlso bestD < r Then Return best
+			Next
+		Next
+		Return Nothing
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Skóra zbiornika: ściany połączone stycznie z ziarnem
+	' ---------------------------------------------------------------
+	Private Sub BuildSkin(seed As Face)
+		Dim queue As New Queue(Of Integer)
+		AddSkinFace(seed)
+		queue.Enqueue(0)
+		While queue.Count > 0
+			Dim f As Face = _skin(queue.Dequeue())
+			Dim k As String = FaceKey(f)
+			For Each e As Edge In f.Edges
+				For Each f2 As Face In e.Faces
+					Dim k2 As String = FaceKey(f2)
+					If k2 = k OrElse _skinIndex.ContainsKey(k2) Then Continue For
+					If Not IsSmoothJoin(e, f, f2) Then Continue For
+					If _skin.Count >= 500 Then Throw New Exception("Za dużo ścian stycznych (>500).")
+					queue.Enqueue(AddSkinFace(f2))
+				Next
+			Next
+		End While
+	End Sub
+
+	Private Function AddSkinFace(f As Face) As Integer
+		_skin.Add(f)
+		Dim idx As Integer = _skin.Count - 1
+		_skinIndex(FaceKey(f)) = idx
+		Return idx
+	End Function
+
+	' Styczne połączenie = normalne obu ścian równoległe w 3 punktach krawędzi.
+	Private Function IsSmoothJoin(e As Edge, fa As Face, fb As Face) As Boolean
+		Dim ev As CurveEvaluator = e.Evaluator
+		Dim t0, t1 As Double
+		ev.GetParamExtents(t0, t1)
+		For Each frac As Double In New Double() {0.2, 0.5, 0.8}
+			Dim p() As Double = EdgePoint(ev, t0 + (t1 - t0) * frac)
+			Dim na() As Double = Normal(fa, p)
+			Dim nb() As Double = Normal(fb, p)
+			If Math.Abs(Dot(na, nb)) < 0.9986 Then Return False ' ~3°
+		Next
+		Return True
+	End Function
+
+	' Krawędź wpalenia: jedna ściana w skórze, druga nie.
+	Private Function IsHoleBoundary(e As Edge) As Boolean
+		If e.Faces.Count <> 2 Then Return False
+		Dim a As Boolean = _skinIndex.ContainsKey(FaceKey(e.Faces.Item(1)))
+		Dim b As Boolean = _skinIndex.ContainsKey(FaceKey(e.Faces.Item(2)))
+		Return a Xor b
+	End Function
+
+	Private Function SkinFaceOf(e As Edge) As Face
+		For Each f As Face In e.Faces
+			If _skinIndex.ContainsKey(FaceKey(f)) Then Return f
+		Next
+		Throw New Exception("Krawędź nie należy do powierzchni zbiornika.")
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Domknięcie pętli wpalenia; Value = True gdy krawędź idzie Start->Stop
+	' ---------------------------------------------------------------
+	Private Function ChainHoleLoop(e0 As Edge) As List(Of KeyValuePair(Of Edge, Boolean))
+		Dim chain As New List(Of KeyValuePair(Of Edge, Boolean))
+		chain.Add(New KeyValuePair(Of Edge, Boolean)(e0, True))
+		If e0.StartVertex Is Nothing OrElse VertexKey(e0.StartVertex) = VertexKey(e0.StopVertex) Then
+			Return chain ' pojedyncza zamknięta krawędź
+		End If
+
+		Dim visited As New HashSet(Of String)
+		visited.Add(EdgeKey(e0))
+		Dim startKey As String = VertexKey(e0.StartVertex)
+		Dim endV As Vertex = e0.StopVertex
+
+		While VertexKey(endV) <> startKey
+			Dim nextEdge As Edge = Nothing
+			For Each e As Edge In endV.Edges
+				If visited.Contains(EdgeKey(e)) Then Continue For
+				If IsHoleBoundary(e) Then
+					nextEdge = e
+					Exit For
+				End If
+			Next
+			If nextEdge Is Nothing Then Throw New Exception("Nie udało się domknąć pętli krawędzi wpalenia.")
+			visited.Add(EdgeKey(nextEdge))
+			Dim fwd As Boolean = (VertexKey(nextEdge.StartVertex) = VertexKey(endV))
+			chain.Add(New KeyValuePair(Of Edge, Boolean)(nextEdge, fwd))
+			endV = If(fwd, nextEdge.StopVertex, nextEdge.StartVertex)
+			If chain.Count > 200 Then Throw New Exception("Pętla wpalenia ma ponad 200 krawędzi - przerwano.")
+		End While
+		Return chain
+	End Function
+
+	' Upewniamy się, że normalna ściany wskazuje NA ZEWNĄTRZ (tam, skąd rzucamy promienie):
+	' promień rzucony wzdłuż -n z punktu nad krawędzią musi trafić w ten sam punkt.
+	Private Sub DetectNormalSign(e As Edge)
+		Dim face As Face = SkinFaceOf(e)
+		Dim ev As CurveEvaluator = e.Evaluator
+		Dim t0, t1 As Double
+		ev.GetParamExtents(t0, t1)
+		Dim p() As Double = EdgePoint(ev, (t0 + t1) / 2.0)
+		Dim d() As Double = Normalize(Cross(Normal(face, p), EdgeTangent(ev, t0 + (t1 - t0) * 0.5)))
+		Dim delta As Double = Math.Min(0.05, XCm / 10.0)
+		' Punkt kontrolny lekko w głąb ściany (po stronie materiału, nie otworu).
+		Dim q() As Double = Add(p, Scale(d, delta * OutwardSign(ev, (t0 + t1) / 2.0, face)))
+		Dim n() As Double = Normal(face, q)
+		For Each sgn As Double In New Double() {1.0, -1.0}
+			Dim hit() As Double = Nothing, hitN() As Double = Nothing, depth As Double
+			Dim hitFace As Face = Nothing
+			If CastDown(q, Scale(n, sgn), 1.0, hit, hitN, depth, hitFace) AndAlso Length(Subtract(hit, q)) < 0.05 Then
+				_normalSign = sgn
+				Return
+			End If
+		Next
+		Throw New Exception("Nie udało się ustalić zewnętrznej strony zbiornika (promień z góry nie trafia w krawędź wpalenia).")
+	End Sub
+
+	' ---------------------------------------------------------------
+	'  Promienie geodezyjne z jednej krawędzi wpalenia
+	' ---------------------------------------------------------------
+	Private Sub ShootFromEdge(e As Edge, forward As Boolean)
+		Dim face As Face = SkinFaceOf(e)
+		Dim ev As CurveEvaluator = e.Evaluator
+		Dim t0, t1, length As Double
+		ev.GetParamExtents(t0, t1)
+		ev.GetLengthAtParam(t0, t1, length)
+
+		' Kierunek "od otworu" ustalamy raz na krawędź, w jej środku.
+		Dim sign As Double = OutwardSign(ev, (t0 + t1) / 2.0, face)
+
+		Dim n As Integer = Math.Max(6, CInt(Math.Ceiling(length / EdgeSampleStepCm)))
+		For i As Integer = 0 To n - 1
+			Dim k As Integer = If(forward, i, n - 1 - i)
+			Dim t As Double
+			ev.GetParamAtLength(t0, (k + 0.5) / n * length, t)
+			Dim p() As Double = EdgePoint(ev, t)
+			Dim nrm() As Double = Scale(Normal(face, p), _normalSign)
+			Dim d() As Double = Scale(Normalize(Cross(nrm, EdgeTangent(ev, t))), sign * _normalSign)
+			_rays.Add(Trace(p, d, nrm))
+		Next
+	End Sub
+
+	Private Function OutwardSign(ev As CurveEvaluator, t As Double, face As Face) As Double
+		Dim p() As Double = EdgePoint(ev, t)
+		Dim d() As Double = Normalize(Cross(Normal(face, p), EdgeTangent(ev, t)))
+		Dim delta As Double = Math.Min(0.05, XCm / 10.0)
+		' Po stronie ściany punkt rzutuje się prawie w miejscu, po stronie otworu ląduje na krawędzi.
+		Dim distPlus As Double = DistToFace(face, Add(p, Scale(d, delta)))
+		Dim distMinus As Double = DistToFace(face, Add(p, Scale(d, -delta)))
+		Return If(distPlus <= distMinus, 1.0, -1.0)
+	End Function
+
+	' Marsz geodezyjny po zewnętrznej powłoce złożenia: krok w płaszczyźnie stycznej,
+	' rzut "z góry" na powłokę, kierunek = cięciwa zrzutowana na nową płaszczyznę styczną.
+	' Idzie na X + ClearanceCm, żeby zobaczyć przeszkodę leżącą tuż za granicą X.
+	Private Function Trace(p() As Double, d() As Double, n0() As Double) As RayPath
+		Dim ray As New RayPath()
+		ray.Add(p, 0, -1, n0) ' na samej krawędzi grubość nieokreślona
+		Dim pos() As Double = p
+		Dim dir() As Double = d
+		Dim nrm() As Double = n0
+		Dim s As Double = 0
+		Dim limit As Double = XCm + ClearanceCm
+		Dim sinMax As Double = Math.Sin(MaxSlopeDeg * Math.PI / 180.0)
+
+		While s < limit - 0.00001
+			Dim stp As Double = Math.Min(MarchStepCm, limit - s)
+			' Pierwszy krok startuje w narożniku przy krawędzi wpalenia - odsuwamy start o 1 mm od niej.
+			Dim lead As Double = If(ray.Pts.Count = 1, Math.Min(0.1, stp / 2.0), 0.0)
+			Dim hit() As Double = Nothing, hitN() As Double = Nothing, depth As Double
+			Dim blocked As Boolean = Not StepOnSurface(pos, dir, nrm, stp, lead, hit, hitN, depth)
+			Dim seg() As Double = Nothing
+			Dim L As Double = 0
+			If Not blocked Then
+				seg = Subtract(hit, pos)
+				L = Length(seg)
+				' Uskok w górę/w dół ostrzejszy niż MaxSlopeDeg albo brak postępu = przeszkoda.
+				blocked = L < 0.0000001 OrElse Math.Abs(Dot(seg, nrm)) / L > sinMax
+			End If
+			If blocked Then
+				MarkBlocked(ray)
+				Exit While
+			End If
+			Dim nd() As Double = Scale(seg, 1.0 / L)
+			nd = Normalize(Subtract(nd, Scale(hitN, Dot(nd, hitN))))
+			pos = hit
+			dir = nd
+			nrm = hitN
+			s += L
+			ray.Add(pos, s, depth, nrm)
+		End While
+
+		ray.Len = If(ray.Blocked, Math.Min(XCm, ray.BlockS - ClearanceCm), XCm)
+		Return ray
+	End Function
+
+	' Przeszkoda za ostatnim punktem. Jeśli przed nią grubość materiału malała
+	' (ukośna ścianka wpalenia "zjada" ściankę zbiornika), przeszkoda zaczyna się
+	' tam, gdzie zaczął się ten ubytek - od tego miejsca liczymy odsunięcie.
+	Private Sub MarkBlocked(ray As RayPath)
+		Dim j As Integer = ray.Pts.Count - 1
+		While j > 0 AndAlso ray.Depth(j - 1) >= 0 AndAlso ray.Depth(j - 1) > ray.Depth(j) + DepthTolCm
+			j -= 1
+		End While
+		ray.Blocked = True
+		ray.BlockS = ray.S(j)
+		_obstacles.Add(ray.Pts(j))
+	End Sub
+
+	' Odsunięcie także w bok: żaden promień nie podchodzi bliżej niż ClearanceCm
+	' do przeszkody wykrytej przez którykolwiek promień.
+	Private Sub ApplyLateralClearance()
+		If _obstacles.Count = 0 Then Return
+		Dim tol As Double = 0.95 * ClearanceCm ' cięciwa po krzywiźnie jest minimalnie krótsza niż łuk
+		For Each ray In _rays
+			For i As Integer = 1 To ray.Pts.Count - 1
+				If ray.S(i) > ray.Len Then Exit For
+				Dim dmin As Double = Double.MaxValue
+				For Each o() As Double In _obstacles
+					dmin = Math.Min(dmin, Length(Subtract(ray.Pts(i), o)))
+				Next
+				If dmin < tol Then
+					ray.Len = Math.Min(ray.Len, Math.Max(0, ray.S(i) - (ClearanceCm - dmin)))
+					Exit For
+				End If
+			Next
+		Next
+	End Sub
+
+	Private Sub BuildRings()
+		_rings = New List(Of List(Of Double()))
+		For r As Integer = 0 To RingCount
+			_rings.Add(New List(Of Double()))
+		Next
+		Dim tooShort As Integer = 0
+		For Each ray In _rays
+			If ray.Len < XCm - 0.001 Then ShortenedRayCount += 1
+			If ray.Len < MinRayCm Then
+				tooShort += 1
+				ray.Len = MinRayCm
+			End If
+			For r As Integer = 0 To RingCount
+				_rings(r).Add(ray.PointAt(ray.Len * r / RingCount))
+			Next
+		Next
+		If tooShort > 0 Then
+			Warnings.Add(tooShort & " promieni ma przeszkodę bliżej niż " & (ClearanceCm * 10).ToString("0") & _
+				" mm od krawędzi wpalenia - strefa ściągnięta prawie do zera. Sprawdź wynik.")
+		End If
+	End Sub
+
+	' ---------------------------------------------------------------
+	'  Jeden krok marszu po zewnętrznej powłoce. Promienie startują zawsze z punktu,
+	'  o którym wiadomo, że jest w powietrzu (tuż nad poprzednim punktem powłoki),
+	'  więc nic, co wisi nad powierzchnią (szyjka pionowego króćca nad nachyloną
+	'  dennicą, kołnierz, wspornik), nie psuje rozpoznania materiału.
+	'  False = przeszkoda (ściana stromsza niż MaxSlopeDeg albo spadek w pustkę).
+	' ---------------------------------------------------------------
+	Private Function StepOnSurface(pos() As Double, dir() As Double, nrm() As Double, stp As Double, lead As Double, _
+			ByRef hit() As Double, ByRef hitN() As Double, ByRef depth As Double) As Boolean
+		Dim o() As Double = Add(Add(pos, Scale(nrm, AirLiftCm)), Scale(dir, lead))
+		Dim ta() As Double = Nothing
+		Dim fa() As Face = Nothing
+
+		' 1. Do przodu: powierzchnia się wznosi (spadek wzmocnienia) albo stoi ściana.
+		If CastRay(o, dir, True, ta, fa) AndAlso ta(0) < stp - lead Then
+			hit = Add(o, Scale(dir, ta(0)))
+			hitN = Normal(fa(0), hit)
+			If Dot(hitN, dir) > 0 Then hitN = Scale(hitN, -1.0)
+			depth = -1
+			Return Dot(hitN, nrm) >= Math.Cos(MaxSlopeDeg * Math.PI / 180.0)
+		End If
+
+		' 2. W dół z końca kroku - ten punkt też jest w powietrzu, bo odcinek do niego był wolny.
+		Dim q() As Double = Add(o, Scale(dir, stp - lead))
+		Dim down() As Double = Scale(nrm, -1.0)
+		If Not CastRay(q, down, False, ta, fa) Then Return False
+		hit = Add(q, Scale(down, ta(0)))
+		hitN = Normal(fa(0), hit)
+		If Dot(hitN, nrm) < 0 Then hitN = Scale(hitN, -1.0)
+		depth = MaterialDepth(ta)
+		Return True
+	End Function
+
+	' Grubość materiału pod pierwszym trafieniem promienia startującego w powietrzu:
+	' każde kolejne trafienie przełącza materiał/powietrze, trafienia w tym samym
+	' miejscu (styk dwóch brył) parami się znoszą, szczelina < GapTolCm to materiał.
+	Private Function MaterialDepth(ta() As Double) As Double
+		Dim i0 As Integer = 0
+		While i0 + 1 < ta.Length AndAlso ta(i0 + 1) - ta(0) < 0.001
+			i0 += 1
+		End While
+		i0 += 1
+		Dim inside As Boolean = True
+		Dim lastExit As Double = Double.NaN
+		While i0 < ta.Length
+			Dim i1 As Integer = i0
+			While i1 + 1 < ta.Length AndAlso ta(i1 + 1) - ta(i0) < 0.001
+				i1 += 1
+			End While
+			If (i1 - i0 + 1) Mod 2 = 1 Then
+				If inside Then
+					lastExit = ta(i0)
+					inside = False
+				ElseIf ta(i0) - lastExit < GapTolCm Then
+					inside = True
+				Else
+					Exit While
+				End If
+			End If
+			i0 = i1 + 1
+		End While
+		If inside Then Return 1000.0
+		Return lastExit - ta(0)
+	End Function
+
+	' Trafienia promienia w ściany złożenia, posortowane po odległości od o.
+	Private Function CastRay(o() As Double, d() As Double, firstOnly As Boolean, ByRef ta() As Double, ByRef fa() As Face) As Boolean
+		Dim ents As ObjectsEnumerator = Nothing
+		Dim locs As ObjectsEnumerator = Nothing
+		_asmDef.FindUsingRay(_tg.CreatePoint(o(0), o(1), o(2)), _tg.CreateUnitVector(d(0), d(1), d(2)), _
+			0.0001, ents, locs, firstOnly)
+		Dim tl As New List(Of Double)
+		Dim fl As New List(Of Face)
+		If ents IsNot Nothing Then
+			For i As Integer = 1 To ents.Count
+				Dim f As Face = TryCast(ents.Item(i), Face)
+				If f Is Nothing Then Continue For
+				Dim lp As Inventor.Point = locs.Item(i)
+				tl.Add((lp.X - o(0)) * d(0) + (lp.Y - o(1)) * d(1) + (lp.Z - o(2)) * d(2))
+				fl.Add(f)
+			Next
+		End If
+		' Pierwszym trafieniem bywa krawędź zamiast ściany - wtedy bierzemy pełną listę.
+		If tl.Count = 0 AndAlso firstOnly AndAlso ents IsNot Nothing AndAlso ents.Count > 0 Then Return CastRay(o, d, False, ta, fa)
+		If tl.Count = 0 Then Return False
+		ta = tl.ToArray()
+		fa = fl.ToArray()
+		Array.Sort(ta, fa)
+		Return True
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Rzut "z góry" (szukanie krawędzi wpalenia i strony zewnętrznej): promień
+	'  wzdłuż -nrm z punktu nad q przez wszystkie bryły złożenia. Zwraca odsłoniętą
+	'  powierzchnię (wejście w materiał) najbliższą q, jej normalną (na zewnątrz),
+	'  grubość materiału pod nią i trafioną ścianę.
+	' ---------------------------------------------------------------
+	Private Function CastDown(q() As Double, nrm() As Double, stp As Double, _
+			ByRef hit() As Double, ByRef hitN() As Double, ByRef depth As Double, ByRef hitFace As Face) As Boolean
+		Dim h As Double = Math.Max(5.0, 3.0 * stp)
+		Dim o() As Double = Add(q, Scale(nrm, h))
+		Dim ta() As Double = Nothing
+		Dim fa() As Face = Nothing
+		If Not CastRay(o, Scale(nrm, -1.0), False, ta, fa) Then Return False
+
+		' Przedziały materiału wzdłuż promienia: każde trafienie przełącza powietrze/materiał,
+		' trafienia w tym samym miejscu (styk dwóch brył) parami się znoszą,
+		' szczelina węższa niż GapTolCm też jest materiałem.
+		Dim starts As New List(Of Integer)
+		Dim ends As New List(Of Double)
+		Dim inside As Boolean = False
+		Dim i0 As Integer = 0
+		While i0 < ta.Length
+			Dim i1 As Integer = i0
+			While i1 + 1 < ta.Length AndAlso ta(i1 + 1) - ta(i0) < 0.001
+				i1 += 1
+			End While
+			If (i1 - i0 + 1) Mod 2 = 1 Then
+				If inside Then
+					ends.Add(ta(i0))
+				ElseIf ends.Count > 0 AndAlso ta(i0) - ends(ends.Count - 1) < GapTolCm Then
+					ends.RemoveAt(ends.Count - 1)
+				Else
+					starts.Add(i0)
+				End If
+				inside = Not inside
+			End If
+			i0 = i1 + 1
+		End While
+		If starts.Count = 0 Then Return False
+		If ends.Count < starts.Count Then ends.Add(Double.MaxValue)
+
+		' Odsłonięta powierzchnia najbliższa przewidywanemu punktowi
+		' (np. pochylona szyjka króćca nad zbiornikiem nie przechwyci marszu).
+		Dim best As Integer = -1
+		Dim bestDist As Double = Double.MaxValue
+		For k As Integer = 0 To starts.Count - 1
+			Dim pt() As Double = Add(o, Scale(nrm, -ta(starts(k))))
+			Dim dd As Double = Length(Subtract(pt, q))
+			If dd < bestDist Then
+				bestDist = dd
+				best = k
+			End If
+		Next
+		hit = Add(o, Scale(nrm, -ta(starts(best))))
+		depth = If(ends(best) = Double.MaxValue, 1000.0, ends(best) - ta(starts(best)))
+		hitFace = fa(starts(best))
+		hitN = Normal(hitFace, hit)
+		If Dot(hitN, nrm) < 0 Then hitN = Scale(hitN, -1.0)
+		Return True
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Wynik: nowa część (powierzchnia + bryła), wstawiona w 0,0,0
+	'  do wskazanego złożenia (główne albo podzłożenie wyników).
+	' ---------------------------------------------------------------
+	Public Function CreateResultPart(targetDef As AssemblyComponentDefinition, baseName As String) As ComponentOccurrence
+		Dim template As String = _app.FileManager.GetTemplateFile(DocumentTypeEnum.kPartDocumentObject, SystemOfMeasureEnum.kMetricSystemOfMeasure)
+		Dim partDoc As PartDocument = _app.Documents.Add(DocumentTypeEnum.kPartDocumentObject, template, False)
+		Dim cd As PartComponentDefinition = partDoc.ComponentDefinition
+
+		' Kolejne próby loftu: wszystkie pierścienie; bez zbyt bliskich punktów;
+		' tylko krawędź, środek i granica. Ostatnia nieudana próba zostawia
+		' pierścienie w części, żeby było widać, co poszło nie tak.
+		Dim loft As LoftFeature = Nothing
+		Dim errors As New List(Of String)
+		For attempt As Integer = 1 To 3
+			Dim ringIdx As New List(Of Integer)
+			If attempt < 3 Then
+				For r As Integer = 0 To RingCount
+					ringIdx.Add(r)
+				Next
+			Else
+				ringIdx.AddRange(New Integer() {0, RingCount \ 2, RingCount})
+			End If
+			Dim sketches As New List(Of Sketch3D)
+			Try
+				loft = BuildLoft(cd, ringIdx, If(attempt = 1, 0.0, 0.05), sketches)
+				Exit For
+			Catch ex As Exception
+				errors.Add("próba " & attempt & ": " & ex.Message)
+				If attempt < 3 Then
+					For Each sk In sketches
+						Try
+							sk.Delete()
+						Catch
+							' szkic mógł nie powstać do końca
+						End Try
+					Next
+				End If
+			End Try
+		Next
+		If loft Is Nothing Then
+			Dim bad As ComponentOccurrence = targetDef.Occurrences.AddByComponentDefinition(cd, _tg.CreateMatrix())
+			bad.Grounded = True
+			SetUniqueName(bad, baseName & "_BLAD")
+			Throw New Exception("loft nie powstał (" & String.Join("; ", errors.ToArray()) & ") - pierścienie zostały w " & bad.Name)
+		End If
+		loft.Name = baseName & "_powierzchnia"
+		If errors.Count > 1 Then
+			Warnings.Add("loft tylko przez 3 pierścienie (pełny się nie udał) - powierzchnia mniej dokładnie przylega do zbiornika")
+		End If
+
+		ResultAreaCm2 = 0
+		Dim faces As FaceCollection = _app.TransientObjects.CreateFaceCollection()
+		For Each b As SurfaceBody In loft.SurfaceBodies
+			For Each f As Face In b.Faces
+				ResultAreaCm2 += f.Evaluator.Area
+				faces.Add(f)
+			Next
+		Next
+
+		' Bryła: pogrubienie na zewnątrz zbiornika - dolna ściana zostaje na powierzchni zbiornika.
+		If ThicknessCm > 0 Then
+			Try
+				Dim th As ThickenFeature = cd.Features.ThickenFeatures.Add(faces, ThicknessCm, _
+					PartFeatureExtentDirectionEnum.kPositiveExtentDirection, PartFeatureOperationEnum.kNewBodyOperation, False)
+				th.Name = baseName
+				If Not IsOutward(th) Then th.Direction = PartFeatureExtentDirectionEnum.kNegativeExtentDirection
+			Catch ex As Exception
+				Warnings.Add("Nie udało się pogrubić powierzchni do bryły: " & ex.Message)
+			End Try
+		End If
+
+		Dim occ As ComponentOccurrence = targetDef.Occurrences.AddByComponentDefinition(cd, _tg.CreateMatrix())
+		occ.Grounded = True
+		SetUniqueName(occ, baseName)
+		Return occ
+	End Function
+
+	' Loft powierzchniowy przez wybrane pierścienie. minGapCm > 0 usuwa punkty leżące
+	' bliżej siebie niż minGapCm (spline przez prawie pokrywające się punkty bywa wadliwy).
+	Private Function BuildLoft(cd As PartComponentDefinition, ringIdx As List(Of Integer), minGapCm As Double, _
+			sketches As List(Of Sketch3D)) As LoftFeature
+		Dim sections As ObjectCollection = _app.TransientObjects.CreateObjectCollection()
+		For Each r As Integer In ringIdx
+			Dim stage As String = "pierścień " & r
+			Try
+				Dim sk As Sketch3D = cd.Sketches3D.Add()
+				sketches.Add(sk)
+				sk.Name = If(r = 0, "Krawedz_wpalenia", If(r = RingCount, "Granica_oblaminowania", "Pierscien_" & r))
+				sk.Visible = (r = 0 OrElse r = RingCount)
+				Dim pts As ObjectCollection = _app.TransientObjects.CreateObjectCollection()
+				Dim last() As Double = Nothing
+				For Each p As Double() In _rings(r)
+					If minGapCm > 0 AndAlso last IsNot Nothing AndAlso Length(Subtract(p, last)) < minGapCm Then Continue For
+					pts.Add(_tg.CreatePoint(p(0), p(1), p(2)))
+					last = p
+				Next
+				If minGapCm > 0 AndAlso pts.Count > 3 Then
+					Dim pf As Inventor.Point = pts.Item(1)
+					If Length(Subtract(last, New Double() {pf.X, pf.Y, pf.Z})) < minGapCm Then pts.Remove(pts.Count)
+				End If
+				stage &= " (" & pts.Count & " pkt): spline"
+				Dim spl As SketchSpline3D = sk.SketchSplines3D.Add(pts, SplineFitMethodEnum.kSweetSplineFit)
+				spl.Closed = True
+				stage = "pierścień " & r & ": profil"
+				Dim prof As Profile3D
+				Try
+					prof = sk.Profiles3D.AddClosed()
+				Catch
+					prof = sk.Profiles3D.AddOpen()
+				End Try
+				sections.Add(prof)
+			Catch ex As Exception
+				Throw New Exception(stage & " - " & ex.Message)
+			End Try
+		Next
+		Try
+			Dim loftDef As LoftDefinition = cd.Features.LoftFeatures.CreateLoftDefinition(sections, PartFeatureOperationEnum.kSurfaceOperation)
+			Return cd.Features.LoftFeatures.Add(loftDef)
+		Catch ex As Exception
+			Throw New Exception("loft - " & ex.Message)
+		End Try
+	End Function
+
+	' Punkt w połowie grubości nad środkiem pierwszego promienia musi leżeć w bryle.
+	Private Function IsOutward(th As ThickenFeature) As Boolean
+		Dim ray As RayPath = _rays(0)
+		Dim s As Double = ray.Len / 2.0
+		Dim p() As Double = Add(ray.PointAt(s), Scale(ray.NormalAt(s), ThicknessCm / 2.0))
+		For Each b As SurfaceBody In th.SurfaceBodies
+			If b.IsPointInside(p, False) = ContainmentEnum.kInsideContainment Then Return True
+		Next
+		Return False
+	End Function
+
+	' Nazwa wystąpienia z prefiksem - kolejne uruchomienia rozpoznają i ukryją wynik na czas liczenia.
+	Public Shared Sub SetUniqueName(occ As ComponentOccurrence, baseName As String)
+		For i As Integer = 1 To 99
+			Try
+				occ.Name = baseName & ":" & i
+				Exit For
+			Catch
+				' nazwa zajęta - próbujemy kolejny numer
+			End Try
+		Next
+	End Sub
+
+	' ---------------------------------------------------------------
+	'  Klucze geometryczne (proxy z złożenia nie mają stabilnej tożsamości COM)
+	' ---------------------------------------------------------------
+	Private Function FaceKey(f As Face) As String
+		Return PtKey(f.PointOnFace) & "|" & f.Evaluator.Area.ToString("F6", CultureInfo.InvariantCulture)
+	End Function
+
+	Private Function VertexKey(v As Vertex) As String
+		Return PtKey(v.Point)
+	End Function
+
+	Private Function EdgeKey(e As Edge) As String
+		Dim ev As CurveEvaluator = e.Evaluator
+		Dim t0, t1 As Double
+		ev.GetParamExtents(t0, t1)
+		Dim p() As Double = EdgePoint(ev, (t0 + t1) / 2.0)
+		Return String.Format(CultureInfo.InvariantCulture, "{0:F5}|{1:F5}|{2:F5}", p(0), p(1), p(2))
+	End Function
+
+	Private Function PtKey(p As Inventor.Point) As String
+		Return String.Format(CultureInfo.InvariantCulture, "{0:F5}|{1:F5}|{2:F5}", p.X, p.Y, p.Z)
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Geometria - wywołania API
+	' ---------------------------------------------------------------
+	Private Function EdgePoint(ev As CurveEvaluator, t As Double) As Double()
+		Dim prm() As Double = {t}
+		Dim pts(2) As Double
+		ev.GetPointAtParam(prm, pts)
+		Return pts
+	End Function
+
+	Private Function EdgeTangent(ev As CurveEvaluator, t As Double) As Double()
+		Dim prm() As Double = {t}
+		Dim tan(2) As Double
+		ev.GetTangent(prm, tan)
+		Return Normalize(tan)
+	End Function
+
+	Private Function Normal(f As Face, p() As Double) As Double()
+		Dim pts() As Double = {p(0), p(1), p(2)}
+		Dim nrm(2) As Double
+		f.Evaluator.GetNormalAtPoint(pts, nrm)
+		Return Normalize(nrm)
+	End Function
+
+	Private Function ClosestOnFace(f As Face, q() As Double) As Double()
+		Dim c As Inventor.Point = f.GetClosestPointTo(_tg.CreatePoint(q(0), q(1), q(2)))
+		Return New Double() {c.X, c.Y, c.Z}
+	End Function
+
+	Private Function DistToFace(f As Face, q() As Double) As Double
+		Return Length(Subtract(ClosestOnFace(f, q), q))
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Wektory
+	' ---------------------------------------------------------------
+	Public Shared Function Add(a() As Double, b() As Double) As Double()
+		Return New Double() {a(0) + b(0), a(1) + b(1), a(2) + b(2)}
+	End Function
+
+	Public Shared Function Subtract(a() As Double, b() As Double) As Double()
+		Return New Double() {a(0) - b(0), a(1) - b(1), a(2) - b(2)}
+	End Function
+
+	Public Shared Function Scale(a() As Double, k As Double) As Double()
+		Return New Double() {a(0) * k, a(1) * k, a(2) * k}
+	End Function
+
+	Public Shared Function Dot(a() As Double, b() As Double) As Double
+		Return a(0) * b(0) + a(1) * b(1) + a(2) * b(2)
+	End Function
+
+	Public Shared Function Cross(a() As Double, b() As Double) As Double()
+		Return New Double() {a(1) * b(2) - a(2) * b(1), a(2) * b(0) - a(0) * b(2), a(0) * b(1) - a(1) * b(0)}
+	End Function
+
+	Public Shared Function Length(a() As Double) As Double
+		Return Math.Sqrt(Dot(a, a))
+	End Function
+
+	Public Shared Function Normalize(a() As Double) As Double()
+		Dim l As Double = Length(a)
+		If l < 1.0E-12 Then Return a
+		Return Scale(a, 1.0 / l)
+	End Function
+
+End Class
+
+' Ścieżka jednego promienia: punkty na powłoce, droga po powierzchni,
+' grubość materiału pod punktem (-1 = nieokreślona), normalna na zewnątrz.
+Public Class RayPath
+	Public Pts As New List(Of Double())
+	Public S As New List(Of Double)
+	Public Depth As New List(Of Double)
+	Public Nrm As New List(Of Double())
+	Public Blocked As Boolean
+	Public BlockS As Double   ' droga do początku przeszkody
+	Public Len As Double      ' końcowa długość promienia (≤ X)
+
+	Public Sub Add(p() As Double, sv As Double, d As Double, n() As Double)
+		Pts.Add(p)
+		S.Add(sv)
+		Depth.Add(d)
+		Nrm.Add(n)
+	End Sub
+
+	' Punkt na drodze s (interpolacja liniowa między punktami marszu).
+	Public Function PointAt(sv As Double) As Double()
+		If sv <= 0 Then Return Pts(0)
+		For i As Integer = 1 To Pts.Count - 1
+			If S(i) >= sv Then
+				Dim t As Double = (sv - S(i - 1)) / Math.Max(S(i) - S(i - 1), 1.0E-12)
+				Return GeodesicOffset.Add(Pts(i - 1), GeodesicOffset.Scale(GeodesicOffset.Subtract(Pts(i), Pts(i - 1)), t))
+			End If
+		Next
+		Return Pts(Pts.Count - 1)
+	End Function
+
+	Public Function NormalAt(sv As Double) As Double()
+		For i As Integer = 0 To Pts.Count - 1
+			If S(i) >= sv Then Return Nrm(i)
+		Next
+		Return Nrm(Nrm.Count - 1)
+	End Function
+End Class
+
+' =====================================================================
+'  Tabela króćców z rysunku DWG
+' =====================================================================
+Public Class NozzleRow
+	Public Pos As String          ' "N2"
+	Public Number As Integer      ' 2
+	Public Name As String = ""
+	Public DN As Double = Double.NaN
+	Public S6 As Double = Double.NaN
+	Public L1 As Double = Double.NaN
+	Public OccName As String = ""
+	Public Status As String = ""
+
+	' Szerokość oblaminowania [mm]; NaN gdy brak danych.
+	Public ReadOnly Property XMm As Double
+		Get
+			Return L1 + 6.0 * S6
+		End Get
+	End Property
+End Class
+
+Public Class DxfText
+	Public Container As String    ' "B:<blok>" albo "E:<arkusz>"
+	Public X As Double
+	Public Y As Double
+	Public Text As String
+End Class
+
+Public Class NozzleTable
+
+	Private Shared ReadOnly PosRx As New Regex("^N0*(\d{1,3})$")
+	Private Shared ReadOnly PosHeaders As String() = {"Pos.", "Pos", "Poz.", "Poz"}
+
+	Public Shared Function ReadDwg(dwgPath As String) As List(Of NozzleRow)
+		Dim dxf As String = ConvertToDxf(dwgPath)
+		Dim inserted As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+		Dim texts As List(Of DxfText) = ParseDxf(dxf, inserted)
+		Return BuildRows(texts, inserted)
+	End Function
+
+	' ---------------------------------------------------------------
+	'  DWG -> DXF przez AutoCAD bez okna (accoreconsole). Plik z Vaulta
+	'  kopiujemy do katalogu tymczasowego - oryginał nie jest otwierany.
+	' ---------------------------------------------------------------
+	Private Shared Function ConvertToDxf(dwgPath As String) As String
+		Dim exe As String = FindAccoreConsole()
+		If exe Is Nothing Then Throw New Exception("Nie znaleziono AutoCAD (accoreconsole.exe) w Program Files\Autodesk.")
+
+		Dim work As String = IO.Path.Combine(IO.Path.GetTempPath(), "Oblaminowanie_dwg")
+		IO.Directory.CreateDirectory(work)
+		Dim dwg As String = IO.Path.Combine(work, "rysunek.dwg")
+		Dim dxf As String = IO.Path.Combine(work, "rysunek.dxf")
+		Dim scr As String = IO.Path.Combine(work, "dxfout.scr")
+		' Pliki z Vaulta są tylko do odczytu, a kopia dziedziczy ten atrybut - zdejmujemy go.
+		For Each f As String In New String() {dwg, dxf}
+			If IO.File.Exists(f) Then
+				IO.File.SetAttributes(f, IO.FileAttributes.Normal)
+				IO.File.Delete(f)
+			End If
+		Next
+		IO.File.Copy(dwgPath, dwg)
+		IO.File.SetAttributes(dwg, IO.FileAttributes.Normal)
+		IO.File.WriteAllText(scr, "FILEDIA 0" & vbCrLf & _
+			"_.DXFOUT """ & dxf & """ _V _2018 16" & vbCrLf & _
+			"_.QUIT _Y" & vbCrLf, Encoding.ASCII)
+
+		Dim psi As New System.Diagnostics.ProcessStartInfo(exe, "/i """ & dwg & """ /s """ & scr & """ /l en-US")
+		psi.UseShellExecute = False
+		psi.CreateNoWindow = True
+		Using p As System.Diagnostics.Process = System.Diagnostics.Process.Start(psi)
+			If Not p.WaitForExit(600000) Then
+				Try
+					p.Kill()
+				Catch
+					' proces mógł się właśnie zakończyć
+				End Try
+				Throw New Exception("AutoCAD nie skończył konwersji rysunku w 10 min.")
+			End If
+		End Using
+		If Not IO.File.Exists(dxf) Then Throw New Exception("AutoCAD nie utworzył pliku DXF z rysunku.")
+		Return dxf
+	End Function
+
+	' Najnowszy AutoCAD, awaryjnie DWG TrueView.
+	Private Shared Function FindAccoreConsole() As String
+		Dim adsk As String = IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFiles), "Autodesk")
+		If Not IO.Directory.Exists(adsk) Then Return Nothing
+		For Each pattern As String In New String() {"AutoCAD 20*", "DWG TrueView*"}
+			Dim dirs() As String = IO.Directory.GetDirectories(adsk, pattern)
+			Array.Sort(dirs)
+			Array.Reverse(dirs)
+			For Each d As String In dirs
+				Dim exe As String = IO.Path.Combine(d, "accoreconsole.exe")
+				If IO.File.Exists(exe) Then Return exe
+			Next
+		Next
+		Return Nothing
+	End Function
+
+	' ---------------------------------------------------------------
+	'  DXF: teksty (TEXT/MTEXT) z bloków i arkuszy + nazwy wstawionych bloków
+	' ---------------------------------------------------------------
+	Private Shared Function ParseDxf(path As String, inserted As HashSet(Of String)) As List(Of DxfText)
+		Dim result As New List(Of DxfText)
+		Dim section As String = ""
+		Dim block As String = ""
+		Dim expectSection As Boolean = False
+		Dim etype As String = ""
+		Dim x As Double = Double.NaN, y As Double = Double.NaN
+		Dim layout As String = ""
+		Dim name2 As String = ""
+		Dim txt As New StringBuilder()
+
+		Using rd As New IO.StreamReader(path, Encoding.UTF8)
+			While True
+				Dim codeLine As String = rd.ReadLine()
+				Dim val As String = rd.ReadLine()
+				Dim code As String = If(codeLine Is Nothing, "0", codeLine.Trim())
+				If codeLine Is Nothing OrElse val Is Nothing OrElse code = "0" Then
+					' koniec poprzedniej encji
+					If etype = "TEXT" OrElse etype = "MTEXT" Then
+						Dim cont As String = If(section = "BLOCKS", "B:" & block, "E:" & If(layout = "", "Model", layout))
+						result.Add(New DxfText With {.Container = cont, .X = x, .Y = y, .Text = CleanMText(txt.ToString())})
+					ElseIf etype = "INSERT" AndAlso name2 <> "" Then
+						inserted.Add(name2)
+					End If
+					If codeLine Is Nothing OrElse val Is Nothing Then Exit While
+					etype = val.Trim()
+					x = Double.NaN
+					y = Double.NaN
+					layout = ""
+					name2 = ""
+					txt.Clear()
+					If etype = "SECTION" Then expectSection = True
+					If etype = "ENDSEC" Then section = ""
+					Continue While
+				End If
+				If expectSection AndAlso code = "2" Then
+					section = val.Trim()
+					expectSection = False
+					Continue While
+				End If
+				Select Case code
+					Case "2"
+						If etype = "BLOCK" Then block = val
+						name2 = val
+					Case "10"
+						If Double.IsNaN(x) Then x = ParseNum(val)
+					Case "20"
+						If Double.IsNaN(y) Then y = ParseNum(val)
+					Case "410"
+						layout = val
+					Case "1", "3"
+						If etype = "TEXT" OrElse etype = "MTEXT" Then txt.Append(val)
+				End Select
+			End While
+		End Using
+		Return result
+	End Function
+
+	' Usuwa kody formatowania MTEXT (\fArial|b0|i0; \W1.00; \P, {...}).
+	Private Shared Function CleanMText(s As String) As String
+		s = s.Replace("\P", " ")
+		s = Regex.Replace(s, "\\[LlOoKk]", "")
+		s = Regex.Replace(s, "\\[A-Za-z][^;\\{}]*;", "")
+		s = s.Replace("{", "").Replace("}", "")
+		Return s.Trim()
+	End Function
+
+	Private Shared Function ParseNum(s As String) As Double
+		Dim v As Double
+		If Double.TryParse(s.Trim().Replace(",", "."), NumberStyles.Float, CultureInfo.InvariantCulture, v) Then Return v
+		Return Double.NaN
+	End Function
+
+	' ---------------------------------------------------------------
+	'  Odbudowa tabeli: blok z wierszami (najwięcej tekstów "N<nr>") +
+	'  blok nagłówka (S6, L1 pod "Overlaminate"), dopasowane po kolumnach Pos.
+	' ---------------------------------------------------------------
+	Private Shared Function BuildRows(texts As List(Of DxfText), inserted As HashSet(Of String)) As List(Of NozzleRow)
+		Dim groups As New Dictionary(Of String, List(Of DxfText))
+		For Each t In texts
+			If Double.IsNaN(t.X) OrElse Double.IsNaN(t.Y) Then Continue For
+			If Not groups.ContainsKey(t.Container) Then groups(t.Container) = New List(Of DxfText)
+			groups(t.Container).Add(t)
+		Next
+
+		' 1. Wiersze: najwięcej pozycji N; przy remisie najwięcej liczb
+		'    (pusty szablon tabeli też ma N1..Nn, ale zamiast wartości "...").
+		Dim rowsCont As List(Of DxfText) = Nothing
+		Dim bestCount As Integer = 0
+		Dim bestNums As Integer = -1
+		For Each kv In groups
+			Dim n As Integer = kv.Value.Where(Function(t) PosRx.IsMatch(t.Text)).Select(Function(t) t.Text).Distinct().Count()
+			Dim nums As Integer = kv.Value.Where(Function(t) Not Double.IsNaN(ParseNum(t.Text))).Count()
+			If n > bestCount OrElse (n = bestCount AndAlso nums > bestNums) Then
+				bestCount = n
+				bestNums = nums
+				rowsCont = kv.Value
+			End If
+		Next
+		If bestCount < 2 Then Throw New Exception("Nie znaleziono tabeli króćców (tekstów N1, N2, ... w jednym bloku).")
+
+		Dim posTexts As List(Of DxfText) = rowsCont.Where(Function(t) PosRx.IsMatch(t.Text)).ToList()
+		Dim leftX As Double = posTexts.Min(Function(t) t.X)
+		Dim rightX As Double = posTexts.Max(Function(t) t.X)
+		Dim midX As Double = (leftX + rightX) / 2.0
+		Dim rows As New List(Of NozzleRow)
+		Dim rowY As New Dictionary(Of NozzleRow, Double)
+		For Each t In posTexts.Where(Function(p) p.X <= midX).OrderByDescending(Function(p) p.Y)
+			If rows.Any(Function(r) r.Pos = t.Text) Then Continue For
+			Dim row As New NozzleRow With {.Pos = t.Text, .Number = CInt(PosRx.Match(t.Text).Groups(1).Value)}
+			rows.Add(row)
+			rowY(row) = t.Y
+		Next
+		Dim ys As List(Of Double) = rowY.Values.OrderByDescending(Function(v) v).ToList()
+		Dim gaps As New List(Of Double)
+		For i As Integer = 1 To ys.Count - 1
+			gaps.Add(ys(i - 1) - ys(i))
+		Next
+		gaps.Sort()
+		Dim rowH As Double = If(gaps.Count > 0, gaps(gaps.Count \ 2), 5.0)
+
+		' 2. Nagłówek - kandydaci z tekstami S6, L1 i Pos.; wybieramy ten, który daje najwięcej wartości.
+		Dim bestScore As Integer = -1
+		Dim bestMap As Func(Of Double, Double) = Nothing
+		Dim bestHeader As List(Of DxfText) = Nothing
+		For Each kv In groups
+			Dim h As List(Of DxfText) = kv.Value
+			If Not (h.Any(Function(t) t.Text = "S6") AndAlso h.Any(Function(t) t.Text = "L1")) Then Continue For
+			Dim hp As List(Of DxfText) = h.Where(Function(t) PosHeaders.Contains(t.Text)).ToList()
+			If hp.Count = 0 Then Continue For
+			Dim hl As Double = hp.Min(Function(t) t.X)
+			Dim hr As Double = hp.Max(Function(t) t.X)
+			Dim sc As Double = If(hr - hl > 0.000001 AndAlso rightX - leftX > 0.000001, (rightX - leftX) / (hr - hl), 1.0)
+			Dim map As Func(Of Double, Double) = Function(xh) leftX + (xh - hl) * sc
+			Dim score As Integer = 0
+			For Each row In rows
+				Dim cells As List(Of DxfText) = CellsOf(rowsCont, rowY(row), rowH)
+				If Not Double.IsNaN(ValueAt(cells, h, map, "S6")) AndAlso Not Double.IsNaN(ValueAt(cells, h, map, "L1")) Then score += 1
+			Next
+			If kv.Key.StartsWith("B:") AndAlso inserted.Contains(kv.Key.Substring(2)) Then score += 1000
+			If score > bestScore Then
+				bestScore = score
+				bestMap = map
+				bestHeader = h
+			End If
+		Next
+		If bestHeader Is Nothing Then Throw New Exception("Nie znaleziono nagłówka tabeli króćców (kolumny S6 i L1).")
+
+		' 3. Wartości
+		Dim dnX As Double = HeaderX(bestHeader, bestMap, "DN")
+		For Each row In rows
+			Dim cells As List(Of DxfText) = CellsOf(rowsCont, rowY(row), rowH)
+			row.S6 = ValueAt(cells, bestHeader, bestMap, "S6")
+			row.L1 = ValueAt(cells, bestHeader, bestMap, "L1")
+			row.DN = ValueAt(cells, bestHeader, bestMap, "DN")
+			' Nazwa: teksty między kolumną Pos. a kolumną DN.
+			Dim nameLimit As Double = If(Double.IsNaN(dnX), Double.MaxValue, dnX - ColumnTol(bestHeader, bestMap, "DN"))
+			row.Name = String.Join(" ", cells.Where(Function(t) t.X > leftX + 0.5 AndAlso t.X < nameLimit AndAlso Not PosRx.IsMatch(t.Text)) _
+				.OrderBy(Function(t) t.X).Select(Function(t) t.Text).ToArray()).Trim()
+		Next
+		Return rows
+	End Function
+
+	Private Shared Function CellsOf(rowsCont As List(Of DxfText), y As Double, rowH As Double) As List(Of DxfText)
+		Return rowsCont.Where(Function(t) Math.Abs(t.Y - y) <= rowH * 0.5).ToList()
+	End Function
+
+	Private Shared Function HeaderX(header As List(Of DxfText), map As Func(Of Double, Double), label As String) As Double
+		Dim t As DxfText = header.FirstOrDefault(Function(h) h.Text = label)
+		Return If(t Is Nothing, Double.NaN, map(t.X))
+	End Function
+
+	' Tolerancja kolumny = połowa odstępu do najbliższego innego nagłówka.
+	Private Shared Function ColumnTol(header As List(Of DxfText), map As Func(Of Double, Double), label As String) As Double
+		Dim cx As Double = HeaderX(header, map, label)
+		If Double.IsNaN(cx) Then Return 0
+		Dim dmin As Double = Double.MaxValue
+		For Each h In header
+			Dim d As Double = Math.Abs(map(h.X) - cx)
+			If d > 0.001 AndAlso d < dmin Then dmin = d
+		Next
+		Return If(dmin = Double.MaxValue, 5.0, dmin * 0.5)
+	End Function
+
+	Private Shared Function ValueAt(cells As List(Of DxfText), header As List(Of DxfText), map As Func(Of Double, Double), label As String) As Double
+		Dim cx As Double = HeaderX(header, map, label)
+		If Double.IsNaN(cx) Then Return Double.NaN
+		Dim tol As Double = ColumnTol(header, map, label)
+		Dim best As DxfText = Nothing
+		Dim bestD As Double = Double.MaxValue
+		For Each c In cells
+			Dim d As Double = Math.Abs(c.X - cx)
+			If d <= tol AndAlso d < bestD AndAlso c.Text <> "" Then
+				bestD = d
+				best = c
+			End If
+		Next
+		Return If(best Is Nothing, Double.NaN, ParseNum(best.Text))
+	End Function
+End Class
+
+' =====================================================================
+'  Pozycja z tabeli -> wystąpienie króćca w złożeniu
+' =====================================================================
+Public Class NozzleMatcher
+
+	Private Shared ReadOnly NumRx As New Regex("(?<![A-Za-z0-9])N0*(\d{1,3})(?![0-9])")
+
+	' Numer pozycji z nazwy wystąpienia ("250461-N2-LF TYPE D..." -> 2), -1 gdy brak.
+	Public Shared Function PosNumber(name As String) As Integer
+		Dim m As Match = NumRx.Match(name)
+		Return If(m.Success, CInt(m.Groups(1).Value), -1)
+	End Function
+
+	' Najpierw numer N w nazwie; bez numeru - iProperty Description = nazwa z tabeli i zgodne DN.
+	' Remis między kandydatami = brak decyzji (zgłaszamy, nie zgadujemy).
+	Public Shared Function Find(def As AssemblyComponentDefinition, row As NozzleRow, used As HashSet(Of String), ByRef why As String) As ComponentOccurrence
+		Dim best As ComponentOccurrence = Nothing
+		Dim bestScore As Integer = -1
+		Dim tied As New List(Of String)
+		For Each occ As ComponentOccurrence In def.Occurrences
+			If occ.Suppressed OrElse used.Contains(occ.Name) Then Continue For
+			If occ.Name.StartsWith(GeodesicOffset.ResultPrefix) Then Continue For
+			Dim byNumber As Boolean = (PosNumber(occ.Name) = row.Number)
+			Dim desc As String = Prop(occ, "Description")
+			Dim descOk As Boolean = row.Name <> "" AndAlso String.Equals(desc.Trim(), row.Name.Trim(), StringComparison.OrdinalIgnoreCase)
+			Dim dnOk As Boolean = HasDn(occ.Name & " " & Prop(occ, "Part Number"), row.DN)
+			If Not byNumber AndAlso Not (descOk AndAlso dnOk) Then Continue For
+			Dim score As Integer = If(byNumber, 10, 0) + If(descOk, 3, 0) + If(dnOk, 1, 0) + _
+				If(occ.DefinitionDocumentType = DocumentTypeEnum.kPartDocumentObject, 1, 0)
+			If score > bestScore Then
+				bestScore = score
+				best = occ
+				tied.Clear()
+				tied.Add(occ.Name)
+			ElseIf score = bestScore Then
+				tied.Add(occ.Name)
+			End If
+		Next
+		If best Is Nothing Then
+			why = "nie znaleziono króćca w złożeniu (ani numeru " & row.Pos & " w nazwie, ani Description """ & row.Name & """ z DN " & row.DN & ")"
+			Return Nothing
+		End If
+		If tied.Count > 1 Then
+			why = "niejednoznaczne - pasuje kilka wystąpień: " & String.Join(", ", tied.ToArray())
+			Return Nothing
+		End If
+		Return best
+	End Function
+
+	Private Shared Function HasDn(text As String, dn As Double) As Boolean
+		If Double.IsNaN(dn) Then Return False
+		Return Regex.IsMatch(text, "DN\s*0*" & CInt(dn).ToString(CultureInfo.InvariantCulture) & "(?![0-9])", RegexOptions.IgnoreCase)
+	End Function
+
+	Private Shared Function Prop(occ As ComponentOccurrence, name As String) As String
+		Try
+			Dim doc As Document = occ.Definition.Document
+			Return CStr(doc.PropertySets.Item("Design Tracking Properties").Item(name).Value)
+		Catch
+			Return ""
+		End Try
+	End Function
+End Class

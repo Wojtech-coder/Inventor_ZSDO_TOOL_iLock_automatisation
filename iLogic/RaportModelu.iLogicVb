@@ -1,0 +1,208 @@
+' =====================================================================
+'  Raport modelu zbiornika - zrzut danych do analizy (dopasowanie
+'  wpaleń do tabeli króćców z rysunku).
+'  Reguła iLogic uruchamiana w ZŁOŻENIU. Wynik: plik .txt obok złożenia.
+'
+'  Zawartość:
+'   - drzewo komponentów: nazwa, plik, położenie i osie, bbox, iProperties
+'   - cechy złożenia (wycięcia wpaleń): typ, zakres, uczestnicy, szkic
+'   - szkice złożenia: płaszczyzna, okręgi/elipsy (środek 3D, średnica)
+'
+'  Jednostki w raporcie: mm, układ współrzędnych złożenia.
+' =====================================================================
+Imports System.Collections.Generic
+Imports System.Globalization
+Imports System.Text
+
+Sub Main()
+	If ThisApplication.ActiveDocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
+		MessageBox.Show("Uruchom regułę w złożeniu zbiornika.", "Raport modelu")
+		Exit Sub
+	End If
+	Dim asmDoc As AssemblyDocument = ThisApplication.ActiveDocument
+	Dim cd As AssemblyComponentDefinition = asmDoc.ComponentDefinition
+
+	Dim sb As New StringBuilder()
+	sb.AppendLine("RAPORT MODELU: " & asmDoc.FullFileName)
+	sb.AppendLine("Data: " & DateTime.Now.ToString("yyyy-MM-dd HH:mm"))
+	sb.AppendLine("Jednostki: mm, układ złożenia. Osie komponentu = kolumny macierzy transformacji.")
+	sb.AppendLine()
+
+	sb.AppendLine("=== KOMPONENTY ===")
+	Dim seenDocs As New HashSet(Of String)
+	For Each occ As ComponentOccurrence In cd.Occurrences
+		DumpOcc(occ, 0, sb, seenDocs)
+	Next
+	sb.AppendLine()
+
+	sb.AppendLine("=== CECHY ZŁOŻENIA ===")
+	For Each f As PartFeature In cd.Features
+		DumpFeature(f, sb)
+	Next
+	sb.AppendLine()
+
+	sb.AppendLine("=== SZKICE ZŁOŻENIA ===")
+	For Each sk As PlanarSketch In cd.Sketches
+		DumpSketch(sk, sb)
+	Next
+
+	Dim name As String = If(asmDoc.FullFileName <> "", IO.Path.GetFileNameWithoutExtension(asmDoc.FullFileName), "zlozenie")
+	Dim outPath As String = WriteReport(name & "_raport_modelu.txt", sb.ToString())
+	System.Diagnostics.Process.Start("notepad.exe", """" & outPath & """")
+End Sub
+
+' Raport do folderu dane/ w repozytorium (do analizy), a gdy się nie da - na Pulpit.
+Function WriteReport(fileName As String, content As String) As String
+	Dim folders() As String = { _
+		"C:\Users\TymickiW\OneDrive - Plasticon Germany GmbH\Kodowanie\GIT_repo\inventor_ZSDO_TOOL_iLock_automatisation\dane", _
+		System.Environment.GetFolderPath(System.Environment.SpecialFolder.Desktop)}
+	Dim lastErr As Exception = Nothing
+	For Each folder As String In folders
+		Try
+			IO.Directory.CreateDirectory(folder)
+			Dim p As String = IO.Path.Combine(folder, fileName)
+			IO.File.WriteAllText(p, content, Encoding.UTF8)
+			Return p
+		Catch ex As Exception
+			lastErr = ex
+		End Try
+	Next
+	Throw lastErr
+End Function
+
+Sub DumpOcc(occ As ComponentOccurrence, depth As Integer, sb As StringBuilder, seenDocs As HashSet(Of String))
+	Dim ind As String = New String(" "c, depth * 2)
+	Dim line As String = ind & "- " & occ.Name
+	Try
+		line &= " | plik: " & IO.Path.GetFileName(occ.ReferencedDocumentDescriptor.FullDocumentName)
+	Catch
+		line &= " | plik: ?"
+	End Try
+	If occ.Suppressed Then
+		sb.AppendLine(line & " | WYGASZONY")
+		Return
+	End If
+	Dim isAsm As Boolean = (occ.DefinitionDocumentType = DocumentTypeEnum.kAssemblyDocumentObject)
+	line &= If(isAsm, " | IAM", " | IPT")
+	If Not occ.Visible Then line &= " | ukryty"
+	sb.AppendLine(line)
+
+	Dim m As Matrix = occ.Transformation
+	sb.AppendLine(ind & "    poz: " & Pt(m.Cell(1, 4), m.Cell(2, 4), m.Cell(3, 4)) & _
+		"  osX: " & Vec(m.Cell(1, 1), m.Cell(2, 1), m.Cell(3, 1)) & _
+		"  osY: " & Vec(m.Cell(1, 2), m.Cell(2, 2), m.Cell(3, 2)) & _
+		"  osZ: " & Vec(m.Cell(1, 3), m.Cell(2, 3), m.Cell(3, 3)))
+	Try
+		Dim rb As Box = occ.RangeBox
+		sb.AppendLine(ind & "    bbox: " & Pt(rb.MinPoint) & " .. " & Pt(rb.MaxPoint))
+	Catch
+	End Try
+	Try
+		Dim doc As Document = occ.Definition.Document
+		sb.AppendLine(ind & "    iProps: " & Props(doc, seenDocs))
+	Catch ex As Exception
+		sb.AppendLine(ind & "    iProps: błąd - " & ex.Message)
+	End Try
+
+	If isAsm AndAlso depth < 3 Then
+		For Each so As ComponentOccurrence In occ.SubOccurrences
+			DumpOcc(so, depth + 1, sb, seenDocs)
+		Next
+	End If
+End Sub
+
+' iProperties dokumentu; przy kolejnym wystąpieniu tego samego pliku tylko odsyłacz.
+Function Props(doc As Document, seenDocs As HashSet(Of String)) As String
+	If seenDocs.Contains(doc.FullFileName) Then Return "(jak wyżej)"
+	seenDocs.Add(doc.FullFileName)
+	Dim parts As New List(Of String)
+	Dim dt As PropertySet = doc.PropertySets.Item("Design Tracking Properties")
+	For Each pn As String In New String() {"Part Number", "Description", "Stock Number"}
+		Try
+			parts.Add(pn & "=" & CStr(dt.Item(pn).Value))
+		Catch
+		End Try
+	Next
+	Try
+		parts.Add("Title=" & CStr(doc.PropertySets.Item("Summary Information").Item("Title").Value))
+	Catch
+	End Try
+	Try
+		For Each p As [Property] In doc.PropertySets.Item("Inventor User Defined Properties")
+			parts.Add(p.Name & "=" & CStr(p.Value))
+		Next
+	Catch
+	End Try
+	Return String.Join(" ; ", parts.ToArray())
+End Function
+
+Sub DumpFeature(f As PartFeature, sb As StringBuilder)
+	Dim line As String = "- " & f.Name & " | " & f.Type.ToString()
+	If f.Suppressed Then line &= " | WYGASZONA"
+	If TypeOf f Is ExtrudeFeature Then
+		Dim ef As ExtrudeFeature = f
+		Try
+			line &= " | zakres: " & ef.ExtentType.ToString()
+		Catch
+		End Try
+		Try
+			Dim sk As PlanarSketch = ef.Profile.Parent
+			line &= " | szkic: " & sk.Name
+		Catch
+		End Try
+		Try
+			Dim names As New List(Of String)
+			For Each o As ComponentOccurrence In ef.Participants
+				names.Add(o.Name)
+			Next
+			line &= " | uczestnicy: " & String.Join(", ", names.ToArray())
+		Catch
+		End Try
+		Try
+			line &= " | bbox: " & Pt(ef.RangeBox.MinPoint) & " .. " & Pt(ef.RangeBox.MaxPoint)
+		Catch
+		End Try
+	End If
+	sb.AppendLine(line)
+End Sub
+
+Sub DumpSketch(sk As PlanarSketch, sb As StringBuilder)
+	Dim line As String = "- " & sk.Name
+	Try
+		Dim pl As Plane = sk.PlanarEntityGeometry
+		line &= " | płaszczyzna: punkt " & Pt(pl.RootPoint) & " normalna " & Vec(pl.Normal.X, pl.Normal.Y, pl.Normal.Z)
+	Catch
+	End Try
+	line &= " | linie: " & sk.SketchLines.Count & ", łuki: " & sk.SketchArcs.Count
+	sb.AppendLine(line)
+	For Each c As SketchCircle In sk.SketchCircles
+		sb.AppendLine("    okrąg: środek " & Pt(sk.SketchToModelSpace(c.CenterSketchPoint.Geometry)) & _
+			"  Ø " & Mm(2 * c.Radius) & If(c.Construction, "  (konstrukcyjny)", ""))
+	Next
+	Try
+		For Each e As SketchEllipse In sk.SketchEllipses
+			sb.AppendLine("    elipsa: środek " & Pt(sk.SketchToModelSpace(e.CenterSketchPoint.Geometry)) & _
+				"  2a " & Mm(2 * e.MajorRadius) & "  2b " & Mm(2 * e.MinorRadius))
+		Next
+	Catch
+	End Try
+End Sub
+
+' ---------------------------------------------------------------
+'  Formatowanie (API w cm -> raport w mm)
+' ---------------------------------------------------------------
+Function Mm(cm As Double) As String
+	Return (cm * 10.0).ToString("0.#", CultureInfo.InvariantCulture)
+End Function
+
+Function Pt(p As Inventor.Point) As String
+	Return Pt(p.X, p.Y, p.Z)
+End Function
+
+Function Pt(x As Double, y As Double, z As Double) As String
+	Return "(" & Mm(x) & ", " & Mm(y) & ", " & Mm(z) & ")"
+End Function
+
+Function Vec(x As Double, y As Double, z As Double) As String
+	Return String.Format(CultureInfo.InvariantCulture, "[{0:0.###}, {1:0.###}, {2:0.###}]", x, y, z)
+End Function
